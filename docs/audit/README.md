@@ -2,6 +2,8 @@
 
 This directory holds **global** inputs for the audit pipeline and **per-run** results under `runs/`.
 
+**Terminal reference (all npm commands and flags):** [USAGE.md](USAGE.md).
+
 ## Quick start
 
 1. **Token:** create a GitHub PAT with `public_repo` (and `read:org` if you later sync team members via API).
@@ -12,7 +14,8 @@ This directory holds **global** inputs for the audit pipeline and **per-run** re
    npm run audit:fetch
    ```
 
-   Writes `raw-data.json`.
+   Writes `raw-data.json`.  
+   **Or** refresh raw data automatically when running the engine: `npm run audit:run -- --refresh-raw` (runs the fetch script first, then the audit).
 
 3. **Edit** `teams-mapping.yaml` so `@asyncapi/...` teams from `raw-data.json` map to member logins (required for team-expanded maintainers).
 
@@ -22,11 +25,18 @@ This directory holds **global** inputs for the audit pipeline and **per-run** re
    npm run audit:run
    ```
 
-   Optional: `npm run audit:run -- --max-repos 5` to limit repos (faster, for testing).
+   Common options:
+
+   - `--max-repos N` — only process the first *N* repos (sorted by name), for testing.
+   - `--activity-cache-mode merge` (**default**) — reuse cached **per-rule GitHub results** from `activity-cache.json` when the cache key matches; **fetch only missing** keys (e.g. new repos, new maintainers, new rule `kind`, or new `since_day` after you change `window_months`).
+   - `--activity-cache-mode all` — ignore cache reads; refetch every rule for every person (still **writes** the cache at the end for next time).
+   - `--activity-cache-mode off` — do not read or write the activity cache (always live API; slowest).
+   - `--activity-cache /path/to/activity-cache.json` — custom cache file (default: `docs/audit/activity-cache.json`).
+   - `--refresh-raw` — run `audit:fetch` before loading `raw-data.json`.
 
 Outputs go to `docs/audit/runs/<run-id>/`:
 
-- `input/` — **snapshot** of `raw-data.json`, `teams-mapping.yaml`, and the rules file used (reproducible after you edit globals).
+- `input/` — **snapshot** of `raw-data.json`, `teams-mapping.yaml`, rules file, and `activity-cache.json` (if it exists when the run starts).
 - `output/` — `full-report.json`, `full-report.md`, `summary.md`, `summary.json`, `emeritus-candidates.md`.
 
 ## Global files
@@ -39,6 +49,9 @@ Outputs go to `docs/audit/runs/<run-id>/`:
 | `rules/RULE_TYPES.md` | Documentation for each `kind` string. |
 | `rules/schema.json` | JSON Schema (informal) for the rules file. |
 | `emeritus-log.md` | **Human / TSC** log after reviewing `emeritus-candidates.md` (not overwritten by the engine). |
+| `activity-cache.json` | Cached **rule evaluation** results keyed by repo, user, `since_day` (from `window_months`), and rule `kind`. Speeds up repeat runs when rules or aggregation change but GitHub data is unchanged. |
+
+Cache keys include **`since_day`**; changing `window_months` in the rules file creates **new** keys, so the first run after a change fetches only those new combinations (merge mode).
 
 ## Spec Kit
 

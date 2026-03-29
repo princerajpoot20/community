@@ -11,7 +11,7 @@ import { execSync } from 'child_process';
 import yaml from 'js-yaml';
 import { Octokit } from '@octokit/rest';
 
-const ENGINE_VERSION = '1.0.1';
+const ENGINE_VERSION = '1.2.0';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, '..');
 const AUDIT = path.join(ROOT, 'docs', 'audit');
@@ -22,12 +22,20 @@ function parseArgs(argv) {
     raw: path.join(AUDIT, 'raw-data.json'),
     teams: path.join(AUDIT, 'teams-mapping.yaml'),
     maxRepos: Infinity,
+    activityCachePath: path.join(AUDIT, 'activity-cache.json'),
+    activityCacheMode: 'merge',
+    refreshRaw: false,
   };
   for (let i = 2; i < argv.length; i++) {
     if (argv[i] === '--rules' && argv[i + 1]) o.rules = path.resolve(argv[++i]);
     else if (argv[i] === '--raw' && argv[i + 1]) o.raw = path.resolve(argv[++i]);
     else if (argv[i] === '--teams' && argv[i + 1]) o.teams = path.resolve(argv[++i]);
     else if (argv[i] === '--max-repos' && argv[i + 1]) o.maxRepos = parseInt(argv[++i], 10) || 1;
+    else if (argv[i] === '--activity-cache' && argv[i + 1]) o.activityCachePath = path.resolve(argv[++i]);
+    else if (argv[i] === '--activity-cache-mode' && argv[i + 1]) {
+      const m = argv[++i];
+      if (['merge', 'all', 'off'].includes(m)) o.activityCacheMode = m;
+    } else if (argv[i] === '--refresh-raw') o.refreshRaw = true;
   }
   return o;
 }
@@ -133,8 +141,32 @@ async function searchCountOr422(octokit, q) {
     throw e;
   }
 }
+function makeRuleCacheKey(fullName, login, sinceDay, kind) {
+  return `rule:${fullName}:${login}:${sinceDay}:${kind}`;
+}
 
-async function evaluateRule(octokit, kind, ctx) {
+function loadActivityCache(filePath) {
+  if (!fs.existsSync(filePath)) {
+    return { schema_version: 1, entries: {} };
+  }
+  try {
+    const j = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    if (j && typeof j.entries === 'object') return j;
+  } catch {
+    /* ignore */
+  }
+  return { schema_version: 1, entries: {} };
+}
+
+function saveActivityCache(filePath, doc) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  doc.updated_at = new Date().toISOString();
+  doc.schema_version = 1;
+  fs.writeFileSync(filePath, JSON.stringify(doc, null, 2) + '\n', 'utf8');
+}
+
+
+async function evaluateRule(octokit, kind, ctx, cacheCtx) {
   const {
     owner,
     repo,
@@ -154,6 +186,36 @@ async function evaluateRule(octokit, kind, ctx) {
       evidence: {},
     };
   }
+
+  const cacheKey = makeRuleCacheKey(fullName, login, sinceDay, kind);
+  if (cacheCtx && cacheCtx.mode === 'merge') {
+    const row = cacheCtx.entries[cacheKey];
+    if (row && row.result && typeof row.result.pass === 'boolean') {
+      return row.result;
+    }
+  }
+
+  const result = await evaluateRuleUncached(octokit, kind, ctx, cacheCtx);
+
+  if (cacheCtx && cacheCtx.mode !== 'off') {
+    cacheCtx.entries[cacheKey] = {
+      fetched_at: new Date().toISOString(),
+      result,
+    };
+    cacheCtx.dirty = true;
+  }
+
+  return result;
+}
+
+async function evaluateRuleUncached(octokit, kind, ctx, cacheCtx) {
+  const {
+    owner,
+    repo,
+    fullName,
+    login,
+    sinceDay,
+  } = ctx;
 
   switch (kind) {
     case 'commit_activity': {
@@ -254,7 +316,7 @@ async function evaluateRule(octokit, kind, ctx) {
     case 'last_interaction_any': {
       const kinds = ['commit_activity', 'merged_pr_author', 'pr_review', 'issue_interaction'];
       for (const k of kinds) {
-        const r = await evaluateRule(octokit, k, ctx);
+        const r = await evaluateRule(octokit, k, ctx, cacheCtx);
         if (r.pass) {
           return {
             pass: true,
@@ -383,6 +445,16 @@ async function main() {
     process.exit(1);
   }
   const opts = parseArgs(process.argv);
+
+  if (opts.refreshRaw) {
+    console.log('Refreshing raw-data (CODEOWNERS) via audit-fetch-raw.mjs ...');
+    execSync(`node "${path.join(ROOT, 'scripts', 'audit-fetch-raw.mjs')}" --out "${opts.raw}"`, {
+      stdio: 'inherit',
+      env: process.env,
+      cwd: ROOT,
+    });
+  }
+
   const rawData = JSON.parse(fs.readFileSync(opts.raw, 'utf8'));
   const reposList = (rawData.repos || []).slice(0, opts.maxRepos);
   const rulesDoc = yaml.load(fs.readFileSync(opts.rules, 'utf8'));
@@ -398,6 +470,13 @@ async function main() {
   const ruleDefs = (rulesDoc.rules || []).filter((r) => r.enabled !== false);
   const aggCfg = rulesDoc.aggregation || { mode: 'profile', profile: 'balanced' };
 
+  const activityCacheDoc = loadActivityCache(opts.activityCachePath);
+  const cacheCtx = {
+    mode: opts.activityCacheMode,
+    entries: activityCacheDoc.entries || {},
+    dirty: false,
+  };
+
   const octokit = new Octokit({ auth: token });
   const runId = makeRunId();
   const runDir = path.join(AUDIT, 'runs', runId);
@@ -409,6 +488,9 @@ async function main() {
   copyFile(opts.raw, path.join(inputDir, 'raw-data.json'));
   copyFile(opts.teams, path.join(inputDir, 'teams-mapping.yaml'));
   copyFile(opts.rules, path.join(inputDir, 'rules.yaml'));
+  if (fs.existsSync(opts.activityCachePath)) {
+    copyFile(opts.activityCachePath, path.join(inputDir, 'activity-cache.json'));
+  }
 
   const manifest = {
     run_id: runId,
@@ -420,6 +502,9 @@ async function main() {
     argv: process.argv.slice(2),
     git_sha: gitShaShort(),
     max_repos: opts.maxRepos === Infinity ? null : opts.maxRepos,
+    refresh_raw: opts.refreshRaw,
+    activity_cache_path: opts.activityCachePath,
+    activity_cache_mode: opts.activityCacheMode,
   };
   fs.writeFileSync(path.join(inputDir, 'manifest.json'), JSON.stringify(manifest, null, 2));
 
@@ -430,6 +515,10 @@ async function main() {
     window_months: windowMonths,
     since_day: sinceDay,
     aggregation: aggCfg,
+    activity_cache: {
+      path: opts.activityCachePath,
+      mode: opts.activityCacheMode,
+    },
     repos: [],
   };
 
@@ -458,7 +547,7 @@ async function main() {
       const rule_results = [];
       for (const def of ruleDefs) {
         const kind = def.kind;
-        const res = await evaluateRule(octokit, kind, ctx);
+        const res = await evaluateRule(octokit, kind, ctx, cacheCtx);
         rule_results.push({
           id: def.id,
           kind,
@@ -501,6 +590,12 @@ async function main() {
     })),
   }, null, 2));
   fs.writeFileSync(path.join(outputDir, 'emeritus-candidates.md'), writeEmeritusMd(report));
+
+  if (opts.activityCacheMode !== 'off' && cacheCtx.dirty) {
+    activityCacheDoc.entries = cacheCtx.entries;
+    saveActivityCache(opts.activityCachePath, activityCacheDoc);
+    console.log(`Activity cache updated: ${opts.activityCachePath}`);
+  }
 
   console.log(`Run complete: ${runDir}`);
   console.log(`  output: ${outputDir}`);
